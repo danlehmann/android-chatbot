@@ -60,6 +60,9 @@ interface MessageDao {
     @Update
     suspend fun update(message: Message)
 
+    @Query("SELECT images FROM messages WHERE images != ''")
+    suspend fun allImages(): List<String>
+
     @Query("DELETE FROM messages WHERE id = :id")
     suspend fun delete(id: Long)
 

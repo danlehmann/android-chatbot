@@ -1,6 +1,19 @@
 package net.daniellehmann.localchat.ui
 
+import android.content.ActivityNotFoundException
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.material.icons.filled.AddPhotoAlternate
+import androidx.compose.material.icons.filled.PhotoCamera
+import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.core.content.FileProvider
+import java.io.File
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
@@ -75,6 +88,7 @@ import net.daniellehmann.localchat.Prefs
 import net.daniellehmann.localchat.Streaming
 import net.daniellehmann.localchat.api.ModelInfo
 import net.daniellehmann.localchat.data.Conversation
+import net.daniellehmann.localchat.data.ImageStore
 import net.daniellehmann.localchat.data.Message
 import net.daniellehmann.localchat.data.Server
 
@@ -119,6 +133,32 @@ fun ChatScreen(vm: ChatViewModel, onOpenServers: () -> Unit) {
     }
 
     var pendingDelete by remember { mutableStateOf<Conversation?>(null) }
+    val attachments by vm.attachments.collectAsState()
+    var viewing by remember { mutableStateOf<File?>(null) }
+
+    val pickPhoto = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        uri?.let { vm.attach(it) }
+    }
+    // Survives process death while the camera app is in front.
+    var cameraPath by rememberSaveable { mutableStateOf<String?>(null) }
+    val takePhoto = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
+        val file = cameraPath?.let(::File)
+        cameraPath = null
+        if (file != null) {
+            if (ok && file.length() > 0) vm.attach(Uri.fromFile(file), deleteAfter = file) else file.delete()
+        }
+    }
+    val launchCamera = {
+        val file = vm.images.newCameraFile()
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+        cameraPath = file.path
+        try {
+            takePhoto.launch(uri)
+        } catch (e: ActivityNotFoundException) {
+            cameraPath = null
+            vm.notify("No camera app available")
+        }
+    }
 
     ModalNavigationDrawer(
         drawerState = drawer,
@@ -191,8 +231,15 @@ fun ChatScreen(vm: ChatViewModel, onOpenServers: () -> Unit) {
                 InputBar(
                     enabled = server != null && model.isNotBlank(),
                     streaming = streaming != null,
+                    attachments = attachments.map { vm.images.file(it) },
                     onSend = { text -> server?.let { vm.send(text, it, model) } },
                     onStop = { vm.stop() },
+                    onPickPhoto = {
+                        pickPhoto.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                    },
+                    onTakePhoto = launchCamera,
+                    onRemoveAttachment = { f -> vm.removeAttachment(f.name) },
+                    onOpenImage = { viewing = it },
                 )
             },
         ) { padding ->
@@ -206,6 +253,8 @@ fun ChatScreen(vm: ChatViewModel, onOpenServers: () -> Unit) {
                 MessageList(
                     messages = messages,
                     streaming = streaming,
+                    images = vm.images,
+                    onOpenImage = { viewing = it },
                     modifier = Modifier.padding(padding).fillMaxSize(),
                     onRegenerate = { vm.regenerate(server, model) },
                     onDelete = { vm.deleteMessage(it) },
@@ -214,6 +263,8 @@ fun ChatScreen(vm: ChatViewModel, onOpenServers: () -> Unit) {
             }
         }
     }
+
+    viewing?.let { f -> FullImageDialog(f, onDismiss = { viewing = null }) }
 
     pendingDelete?.let { c ->
         AlertDialog(
@@ -300,34 +351,75 @@ private fun fmtTokens(n: Int): String = when {
 }
 
 @Composable
-private fun InputBar(enabled: Boolean, streaming: Boolean, onSend: (String) -> Unit, onStop: () -> Unit) {
+private fun InputBar(
+    enabled: Boolean,
+    streaming: Boolean,
+    attachments: List<File>,
+    onSend: (String) -> Unit,
+    onStop: () -> Unit,
+    onPickPhoto: () -> Unit,
+    onTakePhoto: () -> Unit,
+    onRemoveAttachment: (File) -> Unit,
+    onOpenImage: (File) -> Unit,
+) {
     var text by remember { mutableStateOf("") }
-    Row(
+    var attachMenu by remember { mutableStateOf(false) }
+    Column(
         Modifier
             .fillMaxWidth()
             .background(MaterialTheme.colorScheme.surface)
             .navigationBarsPadding()
             .imePadding()
             .padding(horizontal = 12.dp, vertical = 8.dp),
-        verticalAlignment = Alignment.Bottom,
     ) {
-        OutlinedTextField(
-            value = text,
-            onValueChange = { text = it },
-            placeholder = { Text("Message") },
-            maxLines = 6,
-            enabled = enabled,
-            keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
-            modifier = Modifier.weight(1f),
-        )
-        Spacer(Modifier.width(8.dp))
-        if (streaming) {
-            FilledIconButton(onClick = onStop) { Icon(Icons.Default.Stop, "Stop") }
-        } else {
-            FilledIconButton(
-                onClick = { onSend(text); text = "" },
-                enabled = enabled && text.isNotBlank(),
-            ) { Icon(Icons.AutoMirrored.Filled.Send, "Send") }
+        if (attachments.isNotEmpty()) {
+            Row(
+                Modifier
+                    .horizontalScroll(rememberScrollState())
+                    .padding(bottom = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                attachments.forEach { f ->
+                    RemovableThumbnail(f, onOpen = { onOpenImage(f) }, onRemove = { onRemoveAttachment(f) })
+                }
+            }
+        }
+        Row(verticalAlignment = Alignment.Bottom) {
+            Box {
+                IconButton(onClick = { attachMenu = true }, enabled = enabled && !streaming) {
+                    Icon(Icons.Default.AddPhotoAlternate, "Attach image")
+                }
+                DropdownMenu(expanded = attachMenu, onDismissRequest = { attachMenu = false }) {
+                    DropdownMenuItem(
+                        text = { Text("Photo library") },
+                        leadingIcon = { Icon(Icons.Default.PhotoLibrary, null) },
+                        onClick = { attachMenu = false; onPickPhoto() },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Camera") },
+                        leadingIcon = { Icon(Icons.Default.PhotoCamera, null) },
+                        onClick = { attachMenu = false; onTakePhoto() },
+                    )
+                }
+            }
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                placeholder = { Text("Message") },
+                maxLines = 6,
+                enabled = enabled,
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(8.dp))
+            if (streaming) {
+                FilledIconButton(onClick = onStop) { Icon(Icons.Default.Stop, "Stop") }
+            } else {
+                FilledIconButton(
+                    onClick = { onSend(text); text = "" },
+                    enabled = enabled && (text.isNotBlank() || attachments.isNotEmpty()),
+                ) { Icon(Icons.AutoMirrored.Filled.Send, "Send") }
+            }
         }
     }
 }
@@ -336,6 +428,8 @@ private fun InputBar(enabled: Boolean, streaming: Boolean, onSend: (String) -> U
 private fun MessageList(
     messages: List<Message>,
     streaming: Streaming?,
+    images: ImageStore,
+    onOpenImage: (File) -> Unit,
     modifier: Modifier,
     onRegenerate: () -> Unit,
     onDelete: (Message) -> Unit,
@@ -371,6 +465,8 @@ private fun MessageList(
                 liveReasoning = live?.reasoning,
                 isLast = m.id == messages.last().id,
                 generating = live != null,
+                imageFiles = m.imageList.map { images.file(it) },
+                onOpenImage = onOpenImage,
                 onRegenerate = onRegenerate,
                 onDelete = { onDelete(m) },
                 onEdit = { editing = m },
@@ -398,6 +494,8 @@ private fun MessageRow(
     liveReasoning: String?,
     isLast: Boolean,
     generating: Boolean,
+    imageFiles: List<File>,
+    onOpenImage: (File) -> Unit,
     onRegenerate: () -> Unit,
     onDelete: () -> Unit,
     onEdit: () -> Unit,
@@ -426,8 +524,16 @@ private fun MessageRow(
                 .padding(horizontal = if (isUser) 14.dp else 4.dp, vertical = if (isUser) 10.dp else 4.dp),
         ) {
             if (reasoning.isNotBlank()) ReasoningSection(reasoning, generating && content.isEmpty())
+            if (imageFiles.isNotEmpty()) {
+                Row(
+                    Modifier.horizontalScroll(rememberScrollState()).padding(bottom = if (content.isNotEmpty()) 8.dp else 0.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    imageFiles.forEach { f -> Thumbnail(f, if (imageFiles.size == 1) 200.dp else 120.dp) { onOpenImage(f) } }
+                }
+            }
             if (isUser) {
-                Text(content, style = MaterialTheme.typography.bodyLarge)
+                if (content.isNotEmpty()) Text(content, style = MaterialTheme.typography.bodyLarge)
             } else if (content.isNotEmpty()) {
                 if (generating) StreamingMarkdown(content) else MarkdownText(content)
             } else if (generating && reasoning.isBlank()) {

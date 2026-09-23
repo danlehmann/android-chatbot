@@ -1,9 +1,12 @@
 package net.daniellehmann.localchat
 
 import android.app.Application
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -20,6 +23,7 @@ import net.daniellehmann.localchat.api.Usage
 import net.daniellehmann.localchat.api.OpenAiClient
 import net.daniellehmann.localchat.data.AppDatabase
 import net.daniellehmann.localchat.data.Conversation
+import net.daniellehmann.localchat.data.ImageStore
 import net.daniellehmann.localchat.data.Message
 import net.daniellehmann.localchat.data.Server
 
@@ -33,6 +37,15 @@ data class Streaming(
 @OptIn(ExperimentalCoroutinesApi::class)
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val db = AppDatabase.get(app)
+    val images = ImageStore(app)
+
+    /** Images attached to the message being composed (stored file names). */
+    private val _attachments = MutableStateFlow<List<String>>(emptyList())
+    val attachments: StateFlow<List<String>> = _attachments
+
+    init {
+        viewModelScope.launch { cleanupImages() }
+    }
 
     val servers: StateFlow<List<Server>> = db.servers().observeAll()
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
@@ -65,6 +78,32 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private var generation: Job? = null
 
+    // ---- attachments -----------------------------------------------------
+
+    /** Imports [uri] as a draft attachment; [deleteAfter] is a temp file (camera shot) to remove afterwards. */
+    fun attach(uri: Uri, deleteAfter: java.io.File? = null) = viewModelScope.launch {
+        runCatching { withContext(Dispatchers.IO) { images.import(uri) } }
+            .onSuccess { name -> _attachments.update { it + name } }
+            .onFailure { e -> _notice.value = "Could not attach image: ${e.message}" }
+        deleteAfter?.delete()
+    }
+
+    fun notify(message: String) {
+        _notice.value = message
+    }
+
+    fun removeAttachment(name: String) = viewModelScope.launch {
+        _attachments.update { it - name }
+        cleanupImages()
+    }
+
+    /** Removes image files no longer referenced by any message or the current draft. */
+    private suspend fun cleanupImages() = withContext(Dispatchers.IO) {
+        val referenced = db.messages().allImages().flatMap { it.split('\n') }.toMutableSet()
+        referenced += _attachments.value
+        images.retainOnly(referenced)
+    }
+
     // ---- conversations -------------------------------------------------
 
     fun newConversation() {
@@ -79,6 +118,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         if (_streaming.value != null && _currentId.value == id) stop()
         db.conversations().delete(id)
         if (_currentId.value == id) _currentId.value = null
+        cleanupImages()
     }
 
     fun setConversationServer(serverId: Long, model: String) = viewModelScope.launch {
@@ -114,11 +154,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun send(text: String, server: Server, model: String) = viewModelScope.launch {
         if (_streaming.value != null) return@launch
         val trimmed = text.trim()
-        if (trimmed.isEmpty()) return@launch
+        val attached = _attachments.value
+        if (trimmed.isEmpty() && attached.isEmpty()) return@launch
+        _attachments.value = emptyList()
 
         val convId = _currentId.value ?: run {
+            val title = trimmed.lines().first().take(48).ifBlank { "Image" }
             val id = db.conversations().insert(
-                Conversation(title = trimmed.lines().first().take(48), serverId = server.id, model = model),
+                Conversation(title = title, serverId = server.id, model = model),
             )
             _currentId.value = id
             id
@@ -127,7 +170,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         if (conv.serverId != server.id || conv.model != model) {
             db.conversations().update(conv.copy(serverId = server.id, model = model))
         }
-        db.messages().insert(Message(conversationId = convId, role = "user", content = trimmed))
+        db.messages().insert(
+            Message(conversationId = convId, role = "user", content = trimmed, images = attached.joinToString("\n")),
+        )
         generate(convId, server, model)
     }
 
@@ -144,11 +189,21 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun editAndResend(message: Message, newText: String, server: Server, model: String) = viewModelScope.launch {
         if (_streaming.value != null) return@launch
         db.messages().deleteFrom(message.conversationId, message.createdAt, message.id)
-        db.messages().insert(Message(conversationId = message.conversationId, role = "user", content = newText.trim()))
+        db.messages().insert(
+            Message(
+                conversationId = message.conversationId,
+                role = "user",
+                content = newText.trim(),
+                images = message.images,
+            ),
+        )
         generate(message.conversationId, server, model)
     }
 
-    fun deleteMessage(message: Message) = viewModelScope.launch { db.messages().delete(message.id) }
+    fun deleteMessage(message: Message) = viewModelScope.launch {
+        db.messages().delete(message.id)
+        cleanupImages()
+    }
 
     fun stop() {
         generation?.cancel()
@@ -226,19 +281,21 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * Builds the request history: optional system prompt, then the newest
      * messages that fit into the server's character budget.
      */
-    private fun buildRequest(server: Server, history: List<Message>): List<ChatMessage> {
-        val usable = history.filter { it.content.isNotBlank() && it.role != "system" }
+    private suspend fun buildRequest(server: Server, history: List<Message>): List<ChatMessage> = withContext(Dispatchers.IO) {
+        val usable = history.filter { (it.content.isNotBlank() || it.images.isNotBlank()) && it.role != "system" }
         val budget = server.maxContextChars.takeIf { it > 0 } ?: Int.MAX_VALUE
         val picked = ArrayDeque<ChatMessage>()
         var used = server.systemPrompt.length
         for (m in usable.asReversed()) {
-            if (used + m.content.length > budget && picked.isNotEmpty()) break
-            picked.addFirst(ChatMessage(m.role, m.content))
-            used += m.content.length
+            val cost = m.content.length + m.imageList.size * ImageStore.BUDGET_CHARS_PER_IMAGE
+            if (used + cost > budget && picked.isNotEmpty()) break
+            val urls = m.imageList.filter { images.file(it).exists() }.map { images.dataUrl(it) }
+            picked.addFirst(ChatMessage(m.role, m.content, urls))
+            used += cost
         }
         val out = mutableListOf<ChatMessage>()
         if (server.systemPrompt.isNotBlank()) out += ChatMessage("system", server.systemPrompt)
         out += picked
-        return out
+        out
     }
 }

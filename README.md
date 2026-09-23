@@ -18,6 +18,9 @@ cannot talk plain HTTP to anything else.
 - Reasoning / chain-of-thought (`reasoning_content`) shown collapsed.
 - Conversations persisted in Room, listed in a drawer.
 - Long-press a message: copy, delete, edit-and-resend (user), regenerate (last reply).
+- Image attachments for vision models, from the system photo picker or the
+  camera app (no camera or storage permission needed). Images are rotated
+  upright, downscaled to 1568 px and sent as OpenAI-style `image_url` parts.
 - Markdown rendering written in-house (headings, lists, fenced code with copy,
   inline code, bold/italic, quotes, tables, rules).
 - LaTeX math: `\(...\)`, `$...$`, `\[...\]` and `$$...$$` rendered by JLaTeXMath,

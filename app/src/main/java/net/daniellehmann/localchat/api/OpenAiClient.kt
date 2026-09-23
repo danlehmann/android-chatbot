@@ -5,9 +5,9 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -21,8 +21,8 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
-@Serializable
-data class ChatMessage(val role: String, val content: String)
+/** A chat turn. [images] are data: URLs; when present, content is sent in the multi-part vision format. */
+data class ChatMessage(val role: String, val content: String, val images: List<String> = emptyList())
 
 /** One streamed increment. Fields may be empty; usage arrives once at the end if the server supports it. */
 data class Delta(val content: String = "", val reasoning: String = "", val usage: Usage? = null)
@@ -151,12 +151,30 @@ class OpenAiClient(
                 "temperature" to JsonPrimitive(temperature),
                 // Ask for a final usage chunk (OpenAI, vLLM, llama.cpp honour this; others ignore it).
                 "stream_options" to JsonObject(mapOf("include_usage" to JsonPrimitive(true))),
-                "messages" to json.encodeToJsonElement(messages),
+                "messages" to JsonArray(messages.map { it.toJson() }),
             ),
         )
 
-    private fun Json.encodeToJsonElement(messages: List<ChatMessage>): JsonElement =
-        encodeToJsonElement(kotlinx.serialization.builtins.ListSerializer(ChatMessage.serializer()), messages)
+    private fun ChatMessage.toJson(): JsonObject {
+        val body: JsonElement = if (images.isEmpty()) {
+            JsonPrimitive(content)
+        } else {
+            val parts = mutableListOf<JsonElement>()
+            if (content.isNotBlank()) {
+                parts += JsonObject(mapOf("type" to JsonPrimitive("text"), "text" to JsonPrimitive(content)))
+            }
+            images.forEach { url ->
+                parts += JsonObject(
+                    mapOf(
+                        "type" to JsonPrimitive("image_url"),
+                        "image_url" to JsonObject(mapOf("url" to JsonPrimitive(url))),
+                    ),
+                )
+            }
+            JsonArray(parts)
+        }
+        return JsonObject(mapOf("role" to JsonPrimitive(role), "content" to body))
+    }
 
     private fun parseDelta(data: String): Delta? {
         val root = runCatching { json.parseToJsonElement(data).jsonObject }.getOrNull() ?: return null

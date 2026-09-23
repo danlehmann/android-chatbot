@@ -65,5 +65,9 @@ data class Message(
     val reasoning: String = "",
     /** Error text if generation failed; the message is kept so the user can retry. */
     val error: String = "",
+    /** Attached image file names (see ImageStore), newline-separated. */
+    @ColumnInfo(defaultValue = "") val images: String = "",
     val createdAt: Long = System.currentTimeMillis(),
-)
+) {
+    val imageList: List<String> get() = images.split('\n').filter { it.isNotBlank() }
+}

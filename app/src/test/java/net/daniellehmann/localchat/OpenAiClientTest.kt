@@ -79,6 +79,25 @@ class OpenAiClientTest {
     }
 
     @Test
+    fun sendsImagesInVisionFormat() = runBlocking {
+        server.enqueue(MockResponse().setBody("data: [DONE]\n\n"))
+        OpenAiClient(base(), "").streamChat(
+            "m",
+            listOf(
+                ChatMessage("user", "what is this?", listOf("data:image/jpeg;base64,AAAA")),
+                ChatMessage("user", "", listOf("data:image/jpeg;base64,BBBB")),
+            ),
+            1f,
+        ).toList()
+        val body = server.takeRequest().body.readUtf8()
+        val expected1 = """{"role":"user","content":[{"type":"text","text":"what is this?"},""" +
+            """{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}}]}"""
+        val expected2 = """{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,BBBB"}}]}"""
+        assertTrue(body, body.contains(expected1))
+        assertTrue(body, body.contains(expected2))
+    }
+
+    @Test
     fun surfacesServerErrorMessage() = runBlocking {
         server.enqueue(
             MockResponse().setResponseCode(404)
