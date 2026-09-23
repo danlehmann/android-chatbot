@@ -68,3 +68,17 @@ app/src/main/java/net/daniellehmann/localchat/
   ui/ServersScreen.kt   server list and editor
   ui/Markdown.kt        parser + Compose renderer
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
+
+### Third-party notice
+
+Builds of this app include
+[JLaTeXMath for Android](https://github.com/noties/jlatexmath-android)
+(`ru.noties:jlatexmath-android:0.2.0`), which is licensed under the GNU GPL v2
+with a linking exception that permits combining it with independently licensed
+code such as this app. It is used unmodified. Its complete source code is
+available at https://github.com/noties/jlatexmath-android, and the original
+JLaTeXMath project at https://github.com/opencollab/jlatexmath.
